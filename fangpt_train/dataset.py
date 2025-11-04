@@ -1,12 +1,25 @@
-import torch
-from torch.utils.data import Dataset
-from utils import SmilesEnumerator
-import numpy as np
+import math
 import re
 
-class SmileDataset(Dataset):
+import numpy as np
+import torch
+from torch.utils.data import Dataset
 
-    def __init__(self, args, data, content, block_size, aug_prob = 0.5, prop = None, scaffold = None, scaffold_maxlen = None):
+from utils import SmilesEnumerator
+
+class SmileDataset(Dataset):
+    def __init__(
+        self,
+        args,
+        data,
+        content,
+        block_size,
+        aug_prob=0.5,
+        prop=None,
+        scaffold=None,
+        scaffold_maxlen=None,
+        atom_features=None,
+    ):
         chars = sorted(list(set(content)))
         data_size, vocab_size = len(data), len(chars)
         print('data has %d smiles, %d unique characters.' % (data_size, vocab_size))
@@ -18,7 +31,8 @@ class SmileDataset(Dataset):
         self.data = data
         self.prop = prop
         self.sca = scaffold
-        self.scaf_max_len = scaffold_maxlen
+        self.scaf_max_len = scaffold_maxlen or 0
+        self.atom_features = atom_features
         self.debug = args.debug
         self.tfm = SmilesEnumerator()
         self.aug_prob = aug_prob
@@ -30,7 +44,9 @@ class SmileDataset(Dataset):
             return len(self.data)
 
     def __getitem__(self, idx):
-        smiles, prop, scaffold = self.data[idx], self.prop[idx], self.sca[idx]    # self.prop.iloc[idx, :].values  --> if multiple properties
+        smiles = self.data[idx]
+        prop = self.prop[idx] if self.prop is not None else []
+        scaffold = self.sca[idx] if self.sca is not None else ''
         smiles = smiles.strip()
         scaffold = scaffold.strip()
 
@@ -60,6 +76,15 @@ class SmileDataset(Dataset):
         sca_tensor = torch.tensor(sca_dix, dtype=torch.long)
         x = torch.tensor(dix[:-1], dtype=torch.long)
         y = torch.tensor(dix[1:], dtype=torch.long)
-        # prop = torch.tensor([prop], dtype=torch.long)
-        prop = torch.tensor([prop], dtype = torch.float)
-        return x, y, prop, sca_tensor
+        if isinstance(prop, (list, tuple, np.ndarray)):
+            prop_tensor = torch.tensor(prop, dtype=torch.float)
+        else:
+            prop_tensor = torch.tensor([prop], dtype=torch.float)
+
+        if self.atom_features is not None:
+            atom_vector = self.atom_features[idx]
+            atom_tensor = torch.tensor(atom_vector, dtype=torch.float)
+        else:
+            atom_tensor = torch.zeros(0, dtype=torch.float)
+
+        return x, y, prop_tensor, sca_tensor, atom_tensor

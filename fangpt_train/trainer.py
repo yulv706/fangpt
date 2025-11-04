@@ -111,18 +111,32 @@ class Trainer:
 
             losses = []
             pbar = tqdm(enumerate(loader), total=len(loader)) if is_train else enumerate(loader)
-            for it, (x, y, p, scaffold) in pbar:
+            for it, batch in pbar:
+                # unpack batch elements (supports optional atom conditioning)
+                if len(batch) == 5:
+                    x, y, p, scaffold, atom_cond = batch
+                else:
+                    # backward compatibility in case datasets without atom features are reused
+                    x, y, p, scaffold = batch
+                    atom_cond = torch.zeros(x.size(0), 0)
 
                 # place data on the correct device
                 x = x.to(self.device)
                 y = y.to(self.device)
                 p = p.to(self.device)
-                scaffold = scaffold.to(self.device) 
+                scaffold = scaffold.to(self.device)
+                atom_cond = atom_cond.to(self.device)
+                atom_input = None
+                if atom_cond.numel() > 0:
+                    # ensure two-dimensional (batch, features)
+                    if atom_cond.ndim == 1:
+                        atom_cond = atom_cond.unsqueeze(-1)
+                    atom_input = atom_cond
 
                 # forward the model
                 with torch.cuda.amp.autocast():
                     with torch.set_grad_enabled(is_train):
-                        logits, loss, _ = model(x, y, p, scaffold)
+                        logits, loss, _ = model(x, y, p, scaffold, atom_input)
                         loss = loss.mean() # collapse all losses if they are scattered on multiple gpus
                         losses.append(loss.item())
 
@@ -191,7 +205,8 @@ class Trainer:
                     x = torch.tensor([self.stoi[s] for s in regex.findall(context)], dtype=torch.long)[None,...].repeat(512, 1).to('cuda')
                     p = None
                     sca = None
-                    y = sample(model, x, self.config.block_size, temperature=0.8, sample=True, top_k=10, prop = p, scaffold = sca)
+                    atom = None
+                    y = sample(model, x, self.config.block_size, temperature=0.8, sample=True, top_k=10, prop = p, scaffold = sca, atom_cond = atom)
                     for gen_mol in y:
                         completion = ''.join([self.itos[int(i)] for i in gen_mol])
                         completion = completion.replace('<', '')

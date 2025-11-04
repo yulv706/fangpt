@@ -38,7 +38,7 @@ def top_k_logits(logits, k):
     return out
 
 @torch.no_grad()
-def sample(model, x, steps, temperature=1.0, sample=False, top_k=None, prop = None, scaffold = None):
+def sample(model, x, steps, temperature=1.0, sample=False, top_k=None, prop=None, scaffold=None, atom_cond=None):
     """
     take a conditioning sequence of indices in x (of shape (b,t)) and predict the next token in
     the sequence, feeding the predictions back into the model each time. Clearly the sampling
@@ -50,7 +50,7 @@ def sample(model, x, steps, temperature=1.0, sample=False, top_k=None, prop = No
 
     for k in range(steps):
         x_cond = x if x.size(1) <= block_size else x[:, -block_size:] # crop context if needed
-        logits, _, _ = model(x_cond, prop = prop, scaffold = scaffold)   # for liggpt
+        logits, _, _ = model(x_cond, prop=prop, scaffold=scaffold, atom_cond=atom_cond)   # for liggpt
         # logits, _, _ = model(x_cond)   # for char_rnn
         # pluck the logits at the final step and scale by temperature
         logits = logits[:, -1, :] / temperature
