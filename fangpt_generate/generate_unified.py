@@ -50,6 +50,44 @@ def get_mol(smiles_or_mol):
         return mol
     return smiles_or_mol
 
+
+def normalize_symbol(symbol):
+    if symbol is None:
+        return ''
+    symbol = str(symbol).strip().replace('[', '').replace(']', '')
+    if not symbol:
+        return ''
+    if len(symbol) == 1:
+        return symbol.upper()
+    return symbol[0].upper() + symbol[1:].lower()
+
+
+def dedupe_preserve_order(items):
+    seen = set()
+    ordered = []
+    for item in items:
+        if item and item not in seen:
+            ordered.append(item)
+            seen.add(item)
+    return ordered
+
+
+def parse_atom_condition(atom_symbols, condition_args, on_value=1.0, off_value=0.0):
+    if not atom_symbols:
+        return None
+    if not condition_args:
+        return [on_value] * len(atom_symbols)
+    try:
+        values = [float(v) for v in condition_args]
+        if len(values) != len(atom_symbols):
+            raise ValueError
+        return values
+    except ValueError:
+        normalized_targets = {normalize_symbol(v) for v in condition_args if normalize_symbol(v)}
+        if not normalized_targets or normalized_targets == {'None'}:
+            return [off_value] * len(atom_symbols)
+        return [on_value if sym in normalized_targets else off_value for sym in atom_symbols]
+
 def detect_model_config(weight_path):
     """自动检测模型配置"""
     print("🔍 正在自动检测模型配置...")
@@ -69,6 +107,9 @@ def detect_model_config(weight_path):
             num_props = training_config.get('num_props', 0)
             props_list = training_config.get('props', []) if num_props > 0 else []
             
+            atom_cond = training_config.get('atom_cond', False)
+            atom_list = training_config.get('atom_list', []) if atom_cond else []
+            atom_vocab = training_config.get('atom_vocab_size', len(atom_list)) if atom_cond else 0
             config = {
                 'vocab_size': training_config.get('vocab_size', 26),
                 'n_embd': training_config.get('n_embd', 256),
@@ -83,9 +124,13 @@ def detect_model_config(weight_path):
                 'lstm_layers': training_config.get('lstm_layers', 2),
                 'props': props_list,
                 'data_name': training_config.get('data_name', 'moses2'),
+                'atom_cond': atom_cond,
+                'atom_list': atom_list,
+                'atom_vocab_size': atom_vocab,
                 'mask_size': training_config.get('block_size', 54) + 
                            int(num_props > 0) + 
-                           training_config.get('scaffold_maxlen', 0)
+                           training_config.get('scaffold_maxlen', 0) + 
+                           (1 if atom_cond else 0)
             }
             return config
     else:
@@ -148,9 +193,12 @@ def detect_model_config(weight_path):
         'has_lstm': has_lstm,
         'mask_size': mask_size,
         'props': [],  # 旧格式无法推断具体属性
-        'data_name': 'moses2' if vocab_size == 26 else 'guacamol2'
+        'data_name': 'moses2' if vocab_size == 26 else 'guacamol2',
+        'atom_cond': False,
+        'atom_list': [],
+        'atom_vocab_size': 0
     }
-    
+
     return config
 
 def create_dummy_scaffold(scaffold_maxlen, stoi):
@@ -163,7 +211,7 @@ def create_dummy_scaffold(scaffold_maxlen, stoi):
     return torch.tensor([stoi[s] for s in regex.findall(dummy_scaffold)], dtype=torch.long)
 
 def generate_molecules(model, stoi, itos, block_size, batch_size, gen_iter, 
-                      prop_tensor=None, scaffold_tensor=None, context="C"):
+                      prop_tensor=None, scaffold_tensor=None, atom_tensor=None, context="C"):
     """生成分子的核心函数"""
     pattern = "(\[[^\]]+]|<|Br?|Cl?|N|O|S|P|F|I|b|c|n|o|s|p|\(|\)|\.|=|#|-|\+|\\\\|\/|:|~|@|\?|>|\*|\$|\%[0-9]{2}|[0-9])"
     regex = re.compile(pattern)
@@ -181,8 +229,12 @@ def generate_molecules(model, stoi, itos, block_size, batch_size, gen_iter,
         torch.cuda.empty_cache()
         
         # 生成
+        atom = None
+        if atom_tensor is not None:
+            atom = atom_tensor[None, ...].repeat(batch_size, 1).to('cuda')
+
         with torch.no_grad():
-            y = sample(model, x, block_size, temperature=1, sample=True, top_k=None, prop=p, scaffold=sca)
+            y = sample(model, x, block_size, temperature=1, sample=True, top_k=None, prop=p, scaffold=sca, atom_cond=atom)
         
         # 解码分子
         for gen_mol in y:
@@ -239,6 +291,10 @@ def main():
     parser.add_argument('--scaffold', action='store_true', help='启用脚手架条件生成')
     parser.add_argument('--lstm', action='store_true', help='使用LSTM处理脚手架')
     parser.add_argument('--lstm_layers', type=int, default=2, help='LSTM层数')
+    parser.add_argument('--atom_list', nargs='+', default=None, help='训练时使用的原子列表（按顺序）')
+    parser.add_argument('--atom_condition', nargs='+', default=None, help='原子条件向量或需要激活的原子符号')
+    parser.add_argument('--atom_on_value', type=float, default=1.0, help='激活原子的取值')
+    parser.add_argument('--atom_off_value', type=float, default=0.0, help='未激活原子的取值')
     
     # 可选的手动配置参数
     parser.add_argument('--vocab_size', type=int, default=None, help='词汇表大小（自动检测）')
@@ -262,6 +318,24 @@ def main():
     n_layer = args.n_layer or detected_config['n_layer']
     n_head = args.n_head or detected_config['n_head']
     n_embd = args.n_embd or detected_config['n_embd']
+
+    detected_atom_list = detected_config.get('atom_list', [])
+    atom_candidates = args.atom_list if args.atom_list is not None else detected_atom_list
+    atom_symbols = dedupe_preserve_order([normalize_symbol(a) for a in atom_candidates or [] if normalize_symbol(a)])
+    atom_cond_enabled = detected_config.get('atom_cond', bool(atom_symbols))
+    if atom_cond_enabled and not atom_symbols and detected_atom_list:
+        atom_symbols = dedupe_preserve_order([normalize_symbol(a) for a in detected_atom_list if normalize_symbol(a)])
+        atom_cond_enabled = bool(atom_symbols)
+    elif not atom_symbols:
+        atom_cond_enabled = False
+
+    atom_condition_values = parse_atom_condition(
+        atom_symbols,
+        args.atom_condition,
+        on_value=args.atom_on_value,
+        off_value=args.atom_off_value
+    ) if atom_cond_enabled else None
+    atom_condition_tensor = torch.tensor(atom_condition_values, dtype=torch.float) if atom_condition_values is not None else None
     
     # 加载数据和词汇表
     data = pd.read_csv(f'datasets/{args.data_name}.csv')
@@ -294,6 +368,12 @@ def main():
     print(f"\n📖 数据集信息:")
     print(f"  数据集: {args.data_name}")
     print(f"  词汇表大小: {len(itos)}")
+    if atom_cond_enabled:
+        print(f"  原子条件: {atom_symbols}")
+        if atom_condition_values is not None:
+            print(f"  原子向量: {atom_condition_values}")
+    else:
+        print("  原子条件: 未启用")
     
     # 🔧 新增：处理属性条件自动检测
     # 准备属性条件值
@@ -368,7 +448,8 @@ def main():
     mconf = GPTConfig(vocab_size, block_size, num_props=num_props,
                      n_layer=n_layer, n_head=n_head, n_embd=n_embd,
                      scaffold=model_uses_scaffold, scaffold_maxlen=scaffold_maxlen,
-                     lstm=args.lstm, lstm_layers=args.lstm_layers)
+                     lstm=args.lstm, lstm_layers=args.lstm_layers,
+                     atom_cond=atom_cond_enabled and bool(atom_symbols), atom_vocab_size=len(atom_symbols))
     model = GPT(mconf)
     
     # 加载权重
@@ -459,7 +540,7 @@ def main():
             # 生成分子
             molecules = generate_molecules(
                 model, stoi, itos, block_size, args.batch_size, gen_iter,
-                prop_tensor, scaffold_tensor, context
+                prop_tensor, scaffold_tensor, atom_condition_tensor, context
             )
             
             print(f"有效分子数: {len(molecules)}")

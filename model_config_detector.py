@@ -17,6 +17,8 @@ class ModelConfigDetector:
         self.weight_path = weight_path
         self.checkpoint = None
         self.config = {}
+        self.training_config = {}
+        self.new_checkpoint_format = False
         
     def load_checkpoint(self):
         """加载权重文件"""
@@ -32,12 +34,14 @@ class ModelConfigDetector:
             if isinstance(checkpoint_data, dict) and 'model_state_dict' in checkpoint_data:
                 print("🆕 检测到新格式权重文件（包含训练配置）")
                 self.checkpoint = checkpoint_data['model_state_dict']
-                self.training_config = checkpoint_data.get('training_config', {})
+                self.training_config = checkpoint_data.get('training_config', {}) or {}
+                self.new_checkpoint_format = True
                 print(f"📋 训练配置信息: {self.training_config}")
             else:
                 print("🔄 检测到旧格式权重文件（仅包含模型权重）")
                 self.checkpoint = checkpoint_data
                 self.training_config = {}
+                self.new_checkpoint_format = False
             
             print(f"🔢 参数总数: {len(self.checkpoint)}")
         except Exception as e:
@@ -45,16 +49,21 @@ class ModelConfigDetector:
     
     def detect_training_config_from_saved(self):
         """从保存的训练配置中获取信息"""
-        if hasattr(self, 'training_config') and self.training_config:
-            # 直接从保存的配置中读取
+        if self.training_config:
             for key, value in self.training_config.items():
                 self.config[key] = value
-            
-            # 设置便于检测的标志
+
             self.config['has_props'] = self.config.get('num_props', 0) > 0
             self.config['uses_scaffold'] = self.config.get('scaffold', False)
             self.config['has_lstm'] = self.config.get('lstm', False)
-            
+            self.config['has_atom_cond'] = self.config.get('atom_cond', False)
+            self.config['atom_list'] = self.config.get('atom_list', []) or []
+            self.config['props'] = self.config.get('props', []) or []
+            if self.config.get('has_atom_cond'):
+                self.config['atom_vocab_size'] = self.config.get('atom_vocab_size', len(self.config['atom_list']))
+            else:
+                self.config['atom_vocab_size'] = 0
+
             return True
         return False
     
@@ -112,7 +121,16 @@ class ModelConfigDetector:
         # 检测脚手架层
         scaffold_keys = [k for k in self.checkpoint.keys() if 'scaffold' in k.lower()]
         self.config['has_scaffold_layers'] = len(scaffold_keys) > 0
-        
+
+        atom_keys = [k for k in self.checkpoint.keys() if k.startswith('atom_nn')]
+        self.config['has_atom_cond'] = len(atom_keys) > 0
+        if self.config['has_atom_cond'] and 'atom_nn.weight' in self.checkpoint:
+            self.config['atom_vocab_size'] = self.checkpoint['atom_nn.weight'].shape[1]
+        else:
+            self.config['atom_vocab_size'] = self.config.get('atom_vocab_size', 0)
+        self.config.setdefault('atom_list', [])
+        self.config.setdefault('props', [])
+
         # 检测LSTM层
         lstm_keys = [k for k in self.checkpoint.keys() if 'lstm' in k.lower()]
         self.config['has_lstm'] = len(lstm_keys) > 0
@@ -142,9 +160,9 @@ class ModelConfigDetector:
         block_size = self.config['block_size']
         extra_size = mask_size - block_size
         
-        # 根据掩码公式: mask_size = block_size + int(bool(num_props)) + scaffold_maxlen
         prop_contribution = 1 if self.config['has_props'] else 0
-        inferred_scaffold_maxlen = extra_size - prop_contribution
+        atom_contribution = 1 if self.config.get('has_atom_cond') else 0
+        inferred_scaffold_maxlen = extra_size - prop_contribution - atom_contribution
         
         # 验证推断的合理性
         if inferred_scaffold_maxlen < 0:
@@ -159,7 +177,7 @@ class ModelConfigDetector:
         self.config['uses_scaffold'] = inferred_scaffold_maxlen > 0
         
         # 验证配置一致性
-        expected_mask_size = block_size + prop_contribution + inferred_scaffold_maxlen
+        expected_mask_size = block_size + prop_contribution + atom_contribution + inferred_scaffold_maxlen
         self.config['config_consistent'] = (expected_mask_size == mask_size)
     
     def detect_dataset(self):
@@ -198,6 +216,9 @@ class ModelConfigDetector:
             self.detect_conditional_features()
             self.infer_training_config()
             self.detect_dataset()
+
+        self.config.setdefault('props', [])
+        self.config.setdefault('atom_list', [])
         
         return self.config
     
@@ -223,6 +244,11 @@ class ModelConfigDetector:
         print(f"  has_lstm: {self.config.get('has_lstm', False)}")
         if self.config.get('has_lstm'):
             print(f"  lstm_layers: {self.config.get('lstm_layers', 2)}")
+        print(f"  has_atom_cond: {self.config.get('has_atom_cond', False)}")
+        if self.config.get('has_atom_cond'):
+            print(f"  atom_vocab_size: {self.config.get('atom_vocab_size', 0)}")
+            if self.config.get('atom_list'):
+                print(f"  atom_list: {', '.join(self.config['atom_list'])}")
         
         # 配置一致性
         print(f"\n✅ 配置一致性检查:")
@@ -237,11 +263,12 @@ class ModelConfigDetector:
             mask_size = self.config['mask_size']
             block_size = self.config['block_size']
             prop_contrib = 1 if self.config.get('has_props') else 0
+            atom_contrib = 1 if self.config.get('has_atom_cond') else 0
             scaffold_len = self.config.get('scaffold_maxlen', 0)
             
             print(f"\n🔍 掩码大小分析:")
             print(f"  掩码大小: {mask_size}")
-            print(f"  计算公式: {block_size} (序列) + {prop_contrib} (属性) + {scaffold_len} (脚手架) = {block_size + prop_contrib + scaffold_len}")
+            print(f"  计算公式: {block_size} (序列) + {prop_contrib} (属性) + {atom_contrib} (原子) + {scaffold_len} (脚手架) = {block_size + prop_contrib + atom_contrib + scaffold_len}")
     
     def generate_commands(self):
         """生成使用建议"""
@@ -249,87 +276,130 @@ class ModelConfigDetector:
         print("=" * 50)
         
         # 推荐使用统一生成脚本（自动检测配置）
-        print("🌟 推荐使用统一生成脚本（自动检测模型配置）:")
-        print("-" * 45)
+        csv_name = os.path.splitext(os.path.basename(self.weight_path))[0]
+        data_name = self.config.get('data_name') or self.config.get('dataset') or 'moses2'
+        has_atom_cond = self.config.get('has_atom_cond', False)
+        atom_list = [atom for atom in self.config.get('atom_list', []) if atom]
+        missing_props = self.config.get('has_props', False) and not self.config.get('props')
         
-        unified_cmd = [
-            "python generate/generate_unified.py",
+        if not has_atom_cond:
+            print("🌟 推荐使用统一生成脚本（自动检测模型配置）:")
+            print("-" * 45)
+            unified_cmd = [
+                "python generate/generate_unified.py",
+                f"--model_weight {self.weight_path}",
+                f"--csv_name {csv_name}",
+                "--gen_size 10000",
+                "--batch_size 32"
+            ]
+            
+            if data_name:
+                unified_cmd.append(f"--data_name {data_name}")
+            
+            if self.config.get('has_props'):
+                if self.config.get('props'):
+                    props_str = ' '.join(self.config['props'])
+                    unified_cmd.append(f"--props {props_str}")
+                    print(f"  ✅ 检测到训练时使用的属性: {props_str}")
+                else:
+                    unified_cmd.append("--props YOUR_PROPERTY_TYPE")
+                    print("  ⚠️  检测到属性条件模型，但无法从权重文件中确定具体属性类型")
+                    print("  📝 示例：--props qed | --props sas | --props logp | --props tpsa")
+            if self.config.get('uses_scaffold'):
+                unified_cmd.append("--scaffold")
+            if self.config.get('has_lstm'):
+                unified_cmd.append("--lstm")
+            
+            print(" \\\n  ".join(unified_cmd))
+            print("\n  ✨ 统一脚本会自动检测模型配置，无需手动指定架构参数")
+        else:
+            print("🌟 推荐使用统一生成脚本（自动检测模型配置）:")
+            print("-" * 45)
+            print("  ⚠️  当前统一脚本尚未支持原子条件，请使用下方的手动命令")
+        
+        # 手动脚本推荐逻辑
+        generate_new = os.path.exists('fangpt_generate/generate.py')
+        generate_old = os.path.exists('generate/generate.py')
+        needs_new_script = has_atom_cond or self.new_checkpoint_format
+        
+        preferred_script = None
+        fallback_warning = None
+        if needs_new_script:
+            if generate_new:
+                preferred_script = 'fangpt_generate/generate.py'
+            elif generate_old:
+                preferred_script = 'generate/generate.py'
+                fallback_warning = "⚠️  警告: 旧版脚本可能无法正确加载新格式或原子条件模型，请谨慎使用"
+        else:
+            if generate_old:
+                preferred_script = 'generate/generate.py'
+            elif generate_new:
+                preferred_script = 'fangpt_generate/generate.py'
+        
+        if not preferred_script:
+            print("\n❌ 未找到可用的生成脚本，请确认仓库中存在 generate/ 或 fangpt_generate/ 目录。")
+            return
+        
+        print(f"\n💡 手动生成脚本建议:")
+        print("-" * 40)
+        if preferred_script == 'fangpt_generate/generate.py':
+            print("  ✅ 将使用新版生成脚本 fangpt_generate/generate.py")
+        else:
+            print("  ✅ 将使用旧版生成脚本 generate/generate.py")
+            if self.new_checkpoint_format:
+                print("  ⚠️ 检测到新格式权重，旧版脚本可能需要手动修改加载逻辑")
+        
+        manual_cmd = [
+            f"python {preferred_script}",
             f"--model_weight {self.weight_path}",
-            "--csv_name your_output_name",
-            "--gen_size 1000",
+            f"--csv_name {csv_name}",
+            "--gen_size 10000",
             "--batch_size 32"
         ]
         
-        # 根据检测到的配置添加条件参数
-        if self.config.get('has_props'):
-            # 🔧 如果有准确的属性信息，直接使用
-            if 'props' in self.config and self.config['props']:
-                props_str = ' '.join(self.config['props'])
-                unified_cmd.append(f"--props {props_str}")
-                print(f"  ✅ 检测到训练时使用的属性: {props_str}")
-            else:
-                print("  ⚠️  检测到属性条件模型，但无法从权重文件中确定具体属性类型")
-                print("  📝 请根据训练时使用的属性手动指定，例如：")
-                print("      --props qed    (药物相似性)")
-                print("      --props sas    (合成可达性)")  
-                print("      --props logp   (脂水分配系数)")
-                print("      --props tpsa   (极性表面积)")
-                unified_cmd.append("--props YOUR_PROPERTY_TYPE")
+        if data_name:
+            manual_cmd.append(f"--data_name {data_name}")
         
-        if self.config.get('uses_scaffold'):
-            unified_cmd.append("--scaffold")
-        
-        if self.config.get('has_lstm'):
-            unified_cmd.append("--lstm")
-        
-        # 添加数据集参数
-        if 'dataset' in self.config:
-            unified_cmd.append(f"--data_name {self.config['dataset']}")
-        
-        print(" \\\n  ".join(unified_cmd))
-        print("\n  ✨ 统一脚本会自动检测模型配置，无需手动指定架构参数")
-        
-        # 如果用户需要使用原始生成脚本（手动配置）
-        if os.path.exists('generate/generate.py'):
-            print(f"\n💡 如果需要使用原始生成脚本（手动配置）:")
-            print("-" * 40)
-            
-            manual_cmd = ["python generate/generate.py"]
-            manual_cmd.append(f"--model_weight {self.weight_path}")
-            manual_cmd.append("--csv_name your_output_name")
-            
-            # 数据集
-            if 'dataset' in self.config:
-                manual_cmd.append(f"--data_name {self.config['dataset']}")
-            
-            # 基本参数（需要手动指定）
+        if preferred_script == 'generate/generate.py':
             basic_params = ['vocab_size', 'block_size', 'n_layer', 'n_head', 'n_embd']
             for param in basic_params:
                 if param in self.config:
                     manual_cmd.append(f"--{param} {self.config[param]}")
-            
-            # 条件参数
-            if self.config.get('has_props'):
-                if 'props' in self.config and self.config['props']:
-                    props_str = ' '.join(self.config['props'])
-                    manual_cmd.append(f"--props {props_str}")
-                else:
-                    manual_cmd.append("--props YOUR_PROPERTY_TYPE")
-            
-            if self.config.get('uses_scaffold'):
-                manual_cmd.append("--scaffold")
-            
-            if self.config.get('has_lstm'):
-                manual_cmd.append("--lstm")
-                manual_cmd.append(f"--lstm_layers {self.config.get('lstm_layers', 2)}")
-            
-            # 生成参数
-            manual_cmd.append("--gen_size 1000")
-            manual_cmd.append("--batch_size 32")
-            
-            print(" \\\n  ".join(manual_cmd))
+        
+        if self.config.get('uses_scaffold'):
+            manual_cmd.append("--scaffold")
+        if self.config.get('has_lstm'):
+            manual_cmd.append("--lstm")
+            manual_cmd.append(f"--lstm_layers {self.config.get('lstm_layers', 2)}")
+        
+        if self.config.get('has_props'):
+            if self.config.get('props'):
+                props_str = ' '.join(self.config['props'])
+                manual_cmd.append(f"--props {props_str}")
+            else:
+                manual_cmd.append("--props YOUR_PROPERTY_TYPE")
+        
+        if has_atom_cond and atom_list:
+            atom_str = ' '.join(atom_list)
+            manual_cmd.append(f"--atom_list {atom_str}")
+        elif has_atom_cond:
+            print("  ⚠️ 检测到原子条件，但未能解析出训练时的 atom_list，请手动补充")
+        
+        print(" \\\n  ".join(manual_cmd))
+        if fallback_warning:
+            print(f"\n  {fallback_warning}")
+        elif preferred_script == 'generate/generate.py':
             print("\n  ⚠️  原始脚本需要手动指定所有架构参数")
-            
+        if missing_props:
+            print("  📝 请根据训练时的属性设置替换 --props YOUR_PROPERTY_TYPE")
+        
+        if has_atom_cond:
+            if atom_list:
+                print(f"  🔬 检测到原子条件: {', '.join(atom_list)}")
+            print("  👉 请根据目标原子或向量补充 --atom_condition，例如：")
+            print("      --atom_condition O")
+            print("      --atom_condition 1 0 0")
+        
         # 添加属性类型说明
         if self.config.get('has_props'):
             print(f"\n📋 常用属性类型说明:")

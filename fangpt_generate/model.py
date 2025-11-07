@@ -27,6 +27,13 @@ class GPTConfig:
         self.block_size = block_size
         for k,v in kwargs.items():
             setattr(self, k, v)
+        # ensure optional attributes have sane defaults
+        self.num_props = getattr(self, 'num_props', 0)
+        self.scaffold = getattr(self, 'scaffold', False)
+        self.scaffold_maxlen = getattr(self, 'scaffold_maxlen', 0)
+        self.atom_cond = getattr(self, 'atom_cond', False)
+        self.atom_vocab_size = getattr(self, 'atom_vocab_size', 0)
+        self.atom_token_count = getattr(self, 'atom_token_count', 1 if self.atom_cond else 0)
 
 class GPT1Config(GPTConfig):
     """ GPT-1 like network roughly 125M params """
@@ -54,7 +61,11 @@ class CausalSelfAttention(nn.Module):
         # output projection
         self.proj = nn.Linear(config.n_embd, config.n_embd)
         # causal mask to ensure that attention is only applied to the left in the input sequence
-        num = int(bool(config.num_props)) + int(config.scaffold_maxlen)   #int(config.lstm_layers)    #  int(config.scaffold) 
+        num = (
+            int(bool(getattr(config, 'num_props', 0)))
+            + int(getattr(config, 'scaffold_maxlen', 0))
+            + int(getattr(config, 'atom_token_count', 0))
+        )
         # num = 1
         self.register_buffer("mask", torch.tril(torch.ones(config.block_size + num, config.block_size + num))
                                      .view(1, 1, config.block_size + num, config.block_size + num))
@@ -255,10 +266,14 @@ class GPT(nn.Module):
 
         # input embedding stem
         self.config = config
+        # ensure mask aware of atom tokens before blocks are built
+        self.config.atom_token_count = 1 if getattr(self.config, 'atom_cond', False) else 0
         self.tok_emb = nn.Embedding(config.vocab_size, config.n_embd)
         self.type_emb = nn.Embedding(2, config.n_embd)
         if config.num_props:
             self.prop_nn = nn.Linear(config.num_props, config.n_embd)
+        if getattr(config, 'atom_cond', False):
+            self.atom_nn = nn.Linear(config.atom_vocab_size, config.n_embd)
      
         self.pos_emb = nn.Parameter(torch.zeros(1, config.block_size, config.n_embd))
         self.drop = nn.Dropout(config.embd_pdrop)
@@ -337,7 +352,7 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
         return optimizer
 
-    def forward(self, idx, targets=None, prop = None, scaffold = None):
+    def forward(self, idx, targets=None, prop = None, scaffold = None, atom_cond=None):
         b, t = idx.size()
         assert t <= self.block_size, "Cannot forward, model block size is exhausted."
 
@@ -358,6 +373,14 @@ class GPT(nn.Module):
                 p = self.prop_nn(prop)    # for multiproperty
             p += type_embd
             x = torch.cat([p, x], 1)
+
+        if getattr(self.config, 'atom_cond', False) and atom_cond is not None and atom_cond.numel() > 0:
+            type_embd = self.type_emb(torch.zeros((b, 1), dtype=torch.long, device=idx.device))
+            atom_embed = self.atom_nn(atom_cond.unsqueeze(1) if atom_cond.ndim == 2 else atom_cond)
+            if atom_embed.ndim == 2:
+                atom_embed = atom_embed.unsqueeze(1)
+            atom_embed += type_embd
+            x = torch.cat([atom_embed, x], 1)
 
         if self.config.scaffold:
             type_embd = self.type_emb(torch.zeros((b, 1), dtype = torch.long, device = idx.device))
@@ -383,14 +406,10 @@ class GPT(nn.Module):
         logits = self.head(x)
 
         # print(logits.shape)
-        if self.config.num_props and self.config.scaffold:
-            num = int(bool(self.config.num_props)) + int(self.config.scaffold_maxlen)
-        elif self.config.num_props:
-            num = int(bool(self.config.num_props))
-        elif self.config.scaffold:
-            num = int(self.config.scaffold_maxlen) 
-        else:
-            num = 0
+        prop_tokens = int(bool(self.config.num_props))
+        scaffold_tokens = int(self.config.scaffold_maxlen) if self.config.scaffold else 0
+        atom_tokens = int(getattr(self.config, 'atom_token_count', 0)) if getattr(self.config, 'atom_cond', False) else 0
+        num = prop_tokens + scaffold_tokens + atom_tokens
 
         logits = logits[:, num:, :]
 
