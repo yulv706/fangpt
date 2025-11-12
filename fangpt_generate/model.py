@@ -93,139 +93,6 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_drop(self.proj(y))
         return y, attn_save
 
-class FANLayer(nn.Module):
-    def __init__(self, input_dim, output_dim, bias=True, with_gate=True):
-        super(FANLayer, self).__init__()
-        hidden_dim = 4 * input_dim  # 确保 hidden_dim 和 MLP 一样
-
-        self.input_linear_p = nn.Linear(input_dim, hidden_dim // 2, bias=bias)  # 2×input_dim
-        self.input_linear_g = nn.Linear(input_dim, hidden_dim // 2, bias=bias)  # 2×input_dim
-
-        self.activation = nn.GELU()
-        if with_gate:
-            self.gate = nn.Parameter(torch.randn(1, dtype=torch.float32))
-
-        # 这里要确保 output_linear 的输入维度 = torch.cat 后的维度
-        self.output_linear = nn.Linear(hidden_dim * 3 // 2, output_dim)  
-
-    def forward(self, src):
-        g = self.activation(self.input_linear_g(src))  # GELU 激活
-        p = self.input_linear_p(src)  # 线性变换
-
-        if not hasattr(self, 'gate'):
-            output = torch.cat((torch.cos(p), torch.sin(p), g), dim=-1)  # 维度 hidden_dim * 3 / 2
-        else:
-            gate = torch.sigmoid(self.gate)
-            output = torch.cat((gate * torch.cos(p), gate * torch.sin(p), (1 - gate) * g), dim=-1)
-
-        output = self.output_linear(output)  # 压缩回 output_dim
-        return output
-
-# # 新增：改进版本的FANLayer
-# class ImprovedFANLayer(nn.Module):
-#     """改进版FANLayer，更适合分子生成任务"""
-#     def __init__(self, input_dim, output_dim, bias=True, with_gate=False, dropout=0.1):
-#         super(ImprovedFANLayer, self).__init__()
-#         hidden_dim = 4 * input_dim
-        
-#         # 使用更适合序列建模的激活函数组合
-#         self.linear1 = nn.Linear(input_dim, hidden_dim, bias=bias)
-#         self.linear2 = nn.Linear(hidden_dim, hidden_dim // 2, bias=bias)
-#         self.linear3 = nn.Linear(hidden_dim // 2, output_dim, bias=bias)
-        
-#         # 多种激活函数
-#         self.gelu = nn.GELU()
-#         self.swish = nn.SiLU()  # Swish激活函数，对序列任务效果好
-        
-#         # Dropout和LayerNorm
-#         self.dropout = nn.Dropout(dropout)
-#         self.layer_norm = nn.LayerNorm(output_dim)
-        
-#         # 残差连接的投影层（如果维度不匹配）
-#         self.residual_proj = nn.Linear(input_dim, output_dim) if input_dim != output_dim else nn.Identity()
-        
-#         # 门控机制（可选）
-#         self.with_gate = with_gate
-#         if with_gate:
-#             self.gate = nn.Parameter(torch.randn(1, dtype=torch.float32))
-
-#     def forward(self, x):
-#         residual = self.residual_proj(x)
-        
-#         # 第一层：GELU激活
-#         out = self.gelu(self.linear1(x))
-#         out = self.dropout(out)
-        
-#         # 第二层：Swish激活
-#         out = self.swish(self.linear2(out))
-#         out = self.dropout(out)
-        
-#         # 第三层：线性投影
-#         out = self.linear3(out)
-        
-#         # 可选的门控机制
-#         if self.with_gate:
-#             gate = torch.sigmoid(self.gate)
-#             # 门控残差连接 + LayerNorm
-#             out = self.layer_norm(gate * out + (1 - gate) * residual)
-#         else:
-#             # 标准残差连接 + LayerNorm
-#             out = self.layer_norm(out + residual)
-        
-#         return out
-
-# # 新增：轻量级改进版本
-# class LightFANLayer(nn.Module):
-#     """轻量级改进版，保持参数量相近但提升表达能力"""
-#     def __init__(self, input_dim, output_dim, bias=True, with_gate=False, dropout=0.1):
-#         super(LightFANLayer, self).__init__()
-#         hidden_dim = 4 * input_dim
-        
-#         # 分支架构
-#         self.branch1 = nn.Sequential(
-#             nn.Linear(input_dim, hidden_dim // 2, bias=bias),
-#             nn.GELU(),
-#             nn.Dropout(dropout)
-#         )
-        
-#         self.branch2 = nn.Sequential(
-#             nn.Linear(input_dim, hidden_dim // 2, bias=bias),
-#             nn.SiLU(),  # Swish
-#             nn.Dropout(dropout)
-#         )
-        
-#         # 融合层
-#         self.fusion = nn.Linear(hidden_dim, output_dim, bias=bias)
-        
-#         # 残差连接
-#         self.residual_proj = nn.Linear(input_dim, output_dim) if input_dim != output_dim else nn.Identity()
-        
-#         # 门控机制（可选）
-#         self.with_gate = with_gate
-#         if with_gate:
-#             self.gate = nn.Parameter(torch.randn(1, dtype=torch.float32))
-
-#     def forward(self, x):
-#         residual = self.residual_proj(x)
-        
-#         # 双分支处理
-#         branch1_out = self.branch1(x)
-#         branch2_out = self.branch2(x)
-        
-#         # 拼接并融合
-#         combined = torch.cat([branch1_out, branch2_out], dim=-1)
-#         out = self.fusion(combined)
-        
-#         # 可选的门控机制
-#         if self.with_gate:
-#             gate = torch.sigmoid(self.gate)
-#             out = gate * out + (1 - gate) * residual
-#         else:
-#             # 残差连接
-#             out = out + residual
-            
-#         return out
-
 class Block(nn.Module):
     """ an unassuming Transformer block """
 
@@ -234,11 +101,7 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(config.n_embd)
         self.ln2 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        
-        # 添加输入预处理层 - 使用 FANLayer
-        self.input_fan = FANLayer(config.n_embd, config.n_embd, with_gate=False)
-        
-        # 保持原始的 MLP 层
+
         self.mlp = nn.Sequential(
             nn.Linear(config.n_embd, 4 * config.n_embd),
             nn.GELU(),
@@ -247,14 +110,8 @@ class Block(nn.Module):
         )
 
     def forward(self, x):
-        # 输入预处理：先用 FANLayer 处理输入
-        x_processed = self.input_fan(x)
-        
-        # 注意力分支（使用预处理后的输入）
-        y, attn = self.attn(self.ln1(x_processed))
-        x = x + y  # 残差连接到原始输入
-        
-        # MLP 分支
+        y, attn = self.attn(self.ln1(x))
+        x = x + y
         x = x + self.mlp(self.ln2(x))
         return x, attn
 
@@ -324,7 +181,7 @@ class GPT(nn.Module):
                     # all biases will not be decayed
                     no_decay.add(fpn)
                 elif pn.endswith('gate') or 'gate' in pn:
-                    # gate parameters (from FANLayer and fusion_gate) will not be decayed
+                    # gate parameters (if any) will not be decayed
                     no_decay.add(fpn)
                 elif (pn.endswith('weight') or ('weight' in pn)) and isinstance(m, whitelist_weight_modules):
                     # weights of whitelist modules will be weight decayed
